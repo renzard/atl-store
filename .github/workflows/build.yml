@@ -1,21 +1,67 @@
 name: Build ATL + click
 
-# Builds the patched ATL (atl/) natively on an arm64 runner and packages the click.
-# Run it from the Actions tab ("Run workflow") or push to main.
+# Tests on every push and pull request. The (slow) ATL + click build runs on main, on tags and by hand.
+# A tag like v0.2.0 also publishes the click as a GitHub Release.
 on:
   workflow_dispatch:
   push:
     branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 120
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
+      - name: Run the tests
+        run: |
+          set -e
+          for t in tests/test_*.py; do
+            echo "== $t"
+            python3 "$t"
+          done
+
+  build:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: write   # only used to attach the click to a release
+    steps:
+      - uses: actions/checkout@v4
+
+      # ATL takes about an hour to compile. usr/ is reused while the ATL source, the build scripts and
+      # tools/versions.env are unchanged (change versions.env to refresh the dependencies).
+      - name: Cache the built ATL (usr/)
+        id: atl-cache
+        uses: actions/cache@v4
+        with:
+          path: usr
+          key: atl-usr-${{ runner.arch }}-${{ hashFiles('atl/**', 'tools/versions.env', 'tools/*.sh', 'tools/*.py', 'tools/Dockerfile.atl') }}
+
       - name: Build ATL into usr/ (native arm64, no qemu)
+        if: steps.atl-cache.outputs.cache-hit != 'true'
         run: ./tools/build_atl.sh
+
+      - name: Show the exact dependency versions
+        run: |
+          {
+            echo "### ATL build info"
+            echo '```'
+            cat usr/share/atl-build-info.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload usr/ (patched ATL)
         uses: actions/upload-artifact@v4
@@ -24,9 +70,9 @@ jobs:
           path: usr/
 
       - name: Build click package
-        continue-on-error: true
         run: |
-          pip install clickable-ut
+          pip install --user clickable-ut
+          export PATH="$HOME/.local/bin:$PATH"
           clickable build --skip-review
 
       - name: Upload click
@@ -35,4 +81,12 @@ jobs:
           name: droidstore-click
           path: |
             **/*.click
-          if-no-files-found: warn
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            **/*.click
+          generate_release_notes: true

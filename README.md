@@ -27,24 +27,35 @@ from the phone) is bundled. Not covered: files that GTK/WebKit load at runtime (
 GStreamer plugins) are not found by ldd; if an app misses them, the log will say so.
 
 `tools/fetch_sdk.sh` (prebuilt SDK from atl-touch) still works as a shortcut when you don't want to compile ATL.
-The dependency versions are taken from upstream branches; pin them with WOLFSSL_REF, BIONIC_REF, ART_REF.
-The exact versions used end up in `usr/share/atl-build-info.txt`.
+The dependency versions are set in `tools/versions.env` (WOLFSSL_REF, BIONIC_REF, ART_REF, OPENSLES_REF; an environment
+variable wins over the file). Only wolfSSL is pinned by default, the rest follow upstream `master`, so builds can differ over time.
+After a build that works, copy the commits listed in `usr/share/atl-build-info.txt` into `tools/versions.env` to freeze them.
+
+CI (`.github/workflows/build.yml`): the tests run on every push and pull request; the ATL + click build runs on `main`,
+on tags and by hand. `usr/` is cached while `atl/`, `tools/` scripts and `versions.env` are unchanged, so a UI-only change
+does not recompile ATL (about an hour). Pushing a tag such as `v0.2.0` publishes the click as a GitHub Release.
 
 
 Licenses: the store is AGPL-3.0 (`LICENSE`), ATL is GPL-3.0 (`atl/LICENSE.txt`).
 
 ## What it does
 
-- Search an app catalog (F-Droid index-v2), filtered to the device architecture
+- Search an app catalog (F-Droid index-v2), filtered to the device architecture; the list loads more apps as you scroll,
+  so the whole catalog is reachable (apps whose native code does not fit the device are hidden)
 - "Only without native code" filter (pure Java/Kotlin, more likely to work in ATL)
 - App page (tap an app): screenshots, description, what's new, categories, license, permissions, warnings, links
 - Download with progress and sha256 verification
 - Library of installed apps: Open / Delete
+- Updates: the store compares the version of every installed app with the catalog. Apps with a newer version show
+  "Update" (store list, library, app page), and the Installed tab has an "Update all" button. Your own APKs are never updated.
+  After refreshing the catalog the badges are recalculated.
 - Add your own APK (+ button at the top): tap "Choose from an app" and the system asks which app
   (File Manager etc.) to pick the APK from; or pick it from the Downloads/Documents list, or type its path.
   The package and version are read from the manifest, the APK is copied to the library and opened with ATL
   just like catalog apps. It warns you if the APK has native code that doesn't fit the device.
 - ✔ marker for apps confirmed to work (`compat.json` file)
+- Texts (name, summary, description, what's new) use the device language when the repository has it, English otherwise.
+  `tools/build_catalog.py --lang el` does the same for a prebuilt catalog.
 - Settings: ATL command, repository, optional URL of a prebuilt `catalog.json`
 
 ## Layout
@@ -54,13 +65,13 @@ Licenses: the store is AGPL-3.0 (`LICENSE`), ATL is GPL-3.0 (`atl/LICENSE.txt`).
     src/store.py                                         backend (pyotherside)
     src/catalog.py                                       converts the F-Droid index into a small catalog
     tools/build_catalog.py                               builds catalog.json on a PC/server
-    tests/test_backend.py                                offline tests of the backend
+    tests/test_backend.py, tests/test_updates.py, ...    offline tests of the backend (updates, integrity checks, languages)
     compat.json                                          list of confirmed apps
 
 ## What has been tested and what hasn't
 
 - The backend (catalog, download, sha256, library, launch, APK import) is tested offline: `python3 tests/test_backend.py`
-- The QML and the click package have been tested on a device.
+- The QML and the click package have been tested on a device: a **Fairphone 4** running Ubuntu Touch.
 - Unknowns that depend on atl-touch (see the repo's `ci/README.md`):
   - the `LD_LIBRARY_PATH` the store builds is a guess; I haven't seen the atl-touch launcher
   - the SDK is built for Ubuntu Touch 24.04-2.x
@@ -69,14 +80,20 @@ Licenses: the store is AGPL-3.0 (`LICENSE`), ATL is GPL-3.0 (`atl/LICENSE.txt`).
 ## Limitations
 
 - OpenStore build (default): the app is **confined** (AppArmor policy groups in `droidstore.apparmor`) and ships ATL inside the click,
-  so nothing executable is downloaded at runtime. It has been tested on a device, and ATL runs under confinement; if you hit
+  so nothing executable is downloaded at runtime. It has been tested on a Fairphone 4, and ATL runs under confinement; if you hit
   a problem on your setup, look for `apparmor="DENIED"` lines in the syslog and add the matching policy group.
 - Sideload build: point `hooks.droidstore.apparmor` in `manifest.json` at `droidstore-unconfined.apparmor`. This one can download the SDK
   and libraries at runtime (see below) but OpenStore rejects `unconfined`.
 - The whole F-Droid index is big and parsing it needs memory. For production use, build a small catalog
   on a PC/server and put its URL in Settings:
   `python3 tools/build_catalog.py --abi arm64-v8a -o catalog.json`
-- The F-Droid index signature is not verified (only each APK's sha256 against the index).
+- The F-Droid index signature is not verified. What is checked: each APK's sha256 against the index, and the index itself
+  against the sha256 in the repository's `entry.json` (this catches corrupted or truncated downloads, it does not prove who
+  published the index; checking the signature of `entry.jar` against the F-Droid certificate is still to do).
+- Downloads at runtime (sideload build only): the ATL SDK is refused unless its sha256 is known (the `.sha256` file next to it,
+  or a hash pinned in `SDK_SHA256` in `src/store.py`; only the pinned one proves it is authentic). For development you can
+  set `ATL_SDK_ALLOW_UNVERIFIED=1`. System libraries come from `https://ports.ubuntu.com` and each .deb is checked
+  against the SHA256 of the Ubuntu index.
 - `name` in `manifest.json` (`droidstore.renz21`) and `applicationName` in `qml/Main.qml`
   must be changed and must match.
 
@@ -116,6 +133,6 @@ Internet is only needed the first time.
   inside the click and used without downloading.
 - In Settings the ATL command is automatic. `LD_LIBRARY_PATH` is built from the `usr/lib` folders that contain .so files.
 - `builder: pure` in `clickable.yaml` requires a fairly recent Clickable.
-- `manifest.json` declares `architecture: all`, but the SDK and the decoder are arm64, so it is meant for arm64 devices.
-- Tests: `python3 tests/test_backend.py`, `python3 tests/test_sdk.py`, `python3 tests/test_libs.py`, `python3 tests/test_details.py`, `python3 tests/test_import.py`, `python3 tests/test_bundled.py`[README.md](https://github.com/user-attachments/files/33613262/README.md)
+- `manifest.json` declares `architecture: arm64` (the SDK and the decoder are arm64). Raise `version` for every release.
+- Tests: `python3 tests/test_backend.py`, `python3 tests/test_sdk.py`, `python3 tests/test_libs.py`, `python3 tests/test_details.py`, `python3 tests/test_import.py`, `python3 tests/test_bundled.py`, `python3 tests/test_updates.py`
 

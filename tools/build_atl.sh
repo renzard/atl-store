@@ -10,6 +10,12 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 PLATFORM="${PLATFORM:-linux/arm64}"
 IMAGE="droidstore-atl-builder"
 
+# dependency versions (tools/versions.env); exported so that docker run -e passes them on
+set -a
+# shellcheck disable=SC1091
+. "$HERE/tools/versions.env"
+set +a
+
 docker build --platform "$PLATFORM" -t "$IMAGE" -f "$HERE/tools/Dockerfile.atl" "$HERE/tools"
 docker run --rm --platform "$PLATFORM" -v "$HERE":/src -w /src \
     -e WOLFSSL_REF -e BIONIC_REF -e ART_REF -e OPENSLES_REF -e JOBS \

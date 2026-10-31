@@ -3,30 +3,60 @@
 Used both by the app (src/store.py) and by tools/build_catalog.py,
 so you can build the catalog on your own server later.
 """
+import os
+
+_locales = None
+
+
+def preferred_locales():
+    """Locales to try, best first: the device language (LANGUAGE/LC_ALL/LC_MESSAGES/LANG), then en-US and en."""
+    raw = []
+    for var in ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"):
+        for part in (os.environ.get(var) or "").split(":"):
+            part = part.split(".")[0].split("@")[0].strip()
+            if part and part not in ("C", "POSIX"):
+                raw.append(part.replace("_", "-"))
+    result = []
+    for loc in raw + ["en-US", "en"]:
+        for cand in (loc, loc.split("-")[0]):
+            if cand and cand not in result:
+                result.append(cand)
+    return result
+
+
+def set_locales(locales):
+    """Overrides the language choice (e.g. tools/build_catalog.py --lang el)."""
+    global _locales
+    _locales = list(locales) if locales else None
+
+
+def _locale_list():
+    return _locales if _locales is not None else preferred_locales()
+
+
+def pick_locale_key(value):
+    """Which locale pick_localized chooses (so screenshot URLs are built correctly)."""
+    if not (isinstance(value, dict) and value):
+        return ""
+    for loc in _locale_list():
+        if loc in value:
+            return loc
+        for key in value:  # "el" also matches "el-GR"
+            if key.split("-")[0] == loc:
+                return key
+    return next(iter(value))
 
 
 def pick_localized(value, default=""):
-    """index-v2 stores texts as {"en-US": "..."}."""
+    """index-v2 stores texts as {"en-US": "..."}; picks the device language, falling back to English."""
     if not value:
         return default
     if isinstance(value, str):
         return value
     if isinstance(value, dict):
-        for key in ("en-US", "en"):
-            if key in value:
-                return value[key]
-        return next(iter(value.values()), default)
+        key = pick_locale_key(value)
+        return value[key] if key in value else default
     return default
-
-
-def pick_locale_key(value):
-    """Which locale pick_localized chooses (so screenshot URLs are built correctly)."""
-    if isinstance(value, dict) and value:
-        for key in ("en-US", "en"):
-            if key in value:
-                return key
-        return next(iter(value))
-    return ""
 
 
 def _screenshots(meta, pkg_id, repo_url, limit=6):

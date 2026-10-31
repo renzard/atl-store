@@ -12,6 +12,7 @@ import sys
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+import catalog as catalog_module  # noqa: E402
 from catalog import parse_index_v2  # noqa: E402
 
 
@@ -20,8 +21,12 @@ def main():
     ap.add_argument("--repo", default="https://f-droid.org/repo")
     ap.add_argument("--index", help="local index-v2.json instead of downloading")
     ap.add_argument("--abi", action="append", default=[], help="e.g. arm64-v8a (can be repeated)")
+    ap.add_argument("--lang", action="append", default=[],
+                    help="preferred text language, e.g. el or pt-BR (can be repeated; English is the fallback)")
     ap.add_argument("-o", "--output", default="catalog.json")
     args = ap.parse_args()
+    if args.lang:
+        catalog_module.set_locales(args.lang + ["en-US", "en"])
 
     if args.index:
         with open(args.index, encoding="utf-8") as f:

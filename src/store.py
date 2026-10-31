@@ -60,6 +60,11 @@ APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ATL_NAME = "android-translation-layer"
 # The ATL SDK is downloaded here by the app (writable). If usr/ exists inside the click package, that one is used instead.
 SDK_DIR = os.path.join(DATA_DIR, "atl-sdk")
+# Optional pinned hashes {"atl-sdk-arm64.tar.zst": "<sha256>"}: this is what makes the SDK download authentic,
+# the ".sha256" file from the same server only proves the file arrived intact.
+SDK_SHA256 = {}
+# Only for development: allow an SDK without any sha256 (by default the download is refused)
+SDK_ALLOW_UNVERIFIED = os.environ.get("ATL_SDK_ALLOW_UNVERIFIED") == "1"
 SDK_TAG = os.environ.get("ATL_SDK_TAG", "sdk-3d93da2")
 SDK_BASE = os.environ.get("ATL_SDK_BASE", "https://github.com/NotKit/atl-touch/releases/download/%s" % SDK_TAG)
 
@@ -71,7 +76,7 @@ EXTRA_LIB_SCHEME = "2-noble-index"
 LIB_NAME_OVERRIDES = {"libOpenCL.so.1": "ocl-icd-libopencl1"}
 INDEX_SUITES = ("noble", "noble-updates")
 INDEX_COMPONENTS = ("main", "universe")
-PORTS_BASE = os.environ.get("ATL_PORTS_BASE", "http://ports.ubuntu.com/ubuntu-ports")
+PORTS_BASE = os.environ.get("ATL_PORTS_BASE", "https://ports.ubuntu.com/ubuntu-ports")
 
 # The zstd decoder (C extension for arm64) ships inside the click package, in vendor/
 _VENDOR = os.path.join(APP_ROOT, "vendor")
@@ -111,6 +116,7 @@ DEFAULT_SETTINGS = {
 }
 
 PKG_RE = re.compile(r"^[A-Za-z0-9_.]+$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _lock = threading.Lock()
 _catalog = None
@@ -293,13 +299,18 @@ def _install_sdk_worker():
         def progress(phase, fraction):
             pyotherside.send("sdk_progress", phase, fraction)
 
-        expected = None
-        try:
-            req = urllib.request.Request(SDK_BASE + "/" + name + ".sha256", headers={"User-Agent": "droidstore/0.1"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                expected = resp.read().decode().split()[0]
-        except Exception:  # noqa: BLE001  (without .sha256 we continue without verification)
-            expected = None
+        expected = (SDK_SHA256.get(name) or "").lower() or None
+        if not expected:
+            try:
+                req = urllib.request.Request(SDK_BASE + "/" + name + ".sha256", headers={"User-Agent": "droidstore/0.1"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    expected = resp.read().decode().split()[0].lower()
+                if not SHA256_RE.match(expected):
+                    raise ValueError("invalid sha256 file")
+            except Exception as exc:  # noqa: BLE001
+                if not SDK_ALLOW_UNVERIFIED:
+                    raise ValueError("Could not get the sha256 of the SDK (%s): download refused" % exc)
+                expected = None
 
         progress("download", 0.0)
         _download(SDK_BASE + "/" + name, archive, lambda f: progress("download", f), expected)
@@ -400,6 +411,7 @@ def get_details(pkg_id):
         "minSdk": app.get("minSdk", 0),
         "verified": app["id"] in verified,
         "installed": app["id"] in _read_json(LIBRARY_FILE, {}),
+        "updateAvailable": app["id"] in _update_map(),
         "busy": app["id"] in _active,
         "progress": _active.get(app["id"], 0.0),
         "hasDetail": bool(detail.get("description") or detail.get("screenshots") or detail.get("license")),
@@ -429,6 +441,32 @@ def update_catalog():
     threading.Thread(target=_update_catalog, daemon=True).start()
 
 
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _check_index_integrity(repo_url, index_path):
+    """Compares index-v2.json with the sha256 the repo publishes in entry.json.
+
+    This catches truncated/mixed/corrupted downloads. It does NOT prove who published the index
+    (that needs the signature of entry.jar). Repos without entry.json are skipped. Returns True if checked.
+    """
+    try:
+        entry = json.loads(_http_get(repo_url.rstrip("/") + "/entry.json", timeout=30).decode("utf-8"))
+        expected = str((entry.get("index") or {}).get("sha256") or "").lower()
+    except Exception:  # noqa: BLE001  (no entry.json / not JSON: nothing to compare)
+        return False
+    if not SHA256_RE.match(expected):
+        return False
+    if _file_sha256(index_path) != expected:
+        raise ValueError("index-v2.json does not match the sha256 in entry.json: catalog rejected")
+    return True
+
+
 def _update_catalog():
     global _catalog
     try:
@@ -447,8 +485,11 @@ def _update_catalog():
         else:
             tmp = os.path.join(CACHE_DIR, "index-v2.json")
             _download(settings["repo_url"].rstrip("/") + "/index-v2.json", tmp, progress)
-            index = _read_json(tmp, None)
-            os.remove(tmp)
+            try:
+                _check_index_integrity(settings["repo_url"], tmp)
+                index = _read_json(tmp, None)
+            finally:
+                os.remove(tmp)
             if not isinstance(index, dict):
                 raise ValueError("Invalid index")
             catalog = parse_index_v2(index, device_abis(), settings["repo_url"])
@@ -462,10 +503,12 @@ def _update_catalog():
         pyotherside.send("catalog_error", str(exc))
 
 
-def search(query="", pure_only=False, limit=80):
+def search(query="", pure_only=False, limit=80, offset=0):
+    """One page of results (sorted); the UI asks for the next page with offset=<apps already shown>."""
     q = (query or "").strip().lower()
     verified = set(_read_json(COMPAT_FILE, {}).get("verified", []))
     library = _read_json(LIBRARY_FILE, {})
+    updates = _update_map()
     results = []
     for app in _load_catalog():
         if pure_only and app.get("native"):
@@ -483,12 +526,14 @@ def search(query="", pure_only=False, limit=80):
                 "native": bool(app.get("native")),
                 "verified": app["id"] in verified,
                 "installed": app["id"] in library,
+                "updateAvailable": app["id"] in updates,
+                "newVersion": app.get("version", "") if app["id"] in updates else "",
                 "busy": app["id"] in _active,
                 "progress": _active.get(app["id"], 0.0),
             }
         )
     results.sort(key=lambda a: (not a["verified"], a["native"], a["name"].lower()))
-    return results[:limit]
+    return results[offset:offset + limit]
 
 
 # ---------- install / launch ----------
@@ -531,6 +576,7 @@ def _install_worker(app):
             "summary": app.get("summary", ""),
             "icon": app.get("icon", ""),
             "version": app.get("version", ""),
+            "versionCode": app.get("versionCode", 0),
             "apk": dest,
         }
         _write_json(LIBRARY_FILE, library)
@@ -541,10 +587,60 @@ def _install_worker(app):
         _active.pop(pkg_id, None)
 
 
+def _installed_version_code(entry):
+    """versionCode of an installed app. Older library entries have none: it is in the file name (<pkg>_<code>.apk)."""
+    code = entry.get("versionCode")
+    if isinstance(code, int) and code > 0:
+        return code
+    match = re.search(r"_(\d+)\.apk$", entry.get("apk", ""))
+    return int(match.group(1)) if match else 0
+
+
+def _update_map():
+    """{pkgId: catalog app} for the installed apps whose catalog version is newer (own APKs are never updated)."""
+    catalog = {a["id"]: a for a in _load_catalog()}
+    result = {}
+    for pkg_id, entry in _read_json(LIBRARY_FILE, {}).items():
+        app = catalog.get(pkg_id)
+        if entry.get("local") or app is None:
+            continue
+        current = _installed_version_code(entry)
+        if current and app.get("versionCode", 0) > current:  # unknown current version: never a false alarm
+            result[pkg_id] = app
+    return result
+
+
+def updates_available():
+    """Installed apps with a newer version in the catalog."""
+    library = _read_json(LIBRARY_FILE, {})
+    result = [
+        {
+            "pkgId": pkg_id,
+            "name": app["name"],
+            "installedVersion": library[pkg_id].get("version", ""),
+            "newVersion": app.get("version", ""),
+        }
+        for pkg_id, app in _update_map().items()
+    ]
+    return sorted(result, key=lambda a: a["name"].lower())
+
+
+def update_all():
+    """Starts the update of every app that has one (progress/installed/failed events as for install). Returns how many."""
+    pending = list(_update_map())
+    for pkg_id in pending:
+        install(pkg_id)
+    return len(pending)
+
+
 def list_installed():
+    updates = _update_map()
     apps = sorted(_read_json(LIBRARY_FILE, {}).values(), key=lambda a: a["name"].lower())
     return [dict(a, icon=a.get("icon", ""), version=a.get("version", ""), local=bool(a.get("local")),
-                 installed=True, busy=False, progress=0.0) for a in apps]
+                 installed=True, busy=a["pkgId"] in _active, progress=_active.get(a["pkgId"], 0.0),
+                 updateAvailable=a["pkgId"] in updates,
+                 newVersion=updates[a["pkgId"]].get("version", "") if a["pkgId"] in updates else "")
+            for a in apps]
 
 
 def remove(pkg_id):
@@ -579,6 +675,12 @@ def _pool_string(data, off, utf8):
 
 def _read_axml(data):
     """Reads (package, versionName) from an APK's binary AndroidManifest.xml."""
+    info = _read_axml_full(data)
+    return info.get("package", ""), info.get("versionName", "")
+
+
+def _read_axml_full(data):
+    """Reads package, versionName and versionCode (as strings) from the binary AndroidManifest.xml."""
     if len(data) < 8 or struct.unpack_from("<H", data, 0)[0] != 0x0003:
         raise ValueError("Invalid AndroidManifest.xml")
     pos = struct.unpack_from("<H", data, 2)[0]
@@ -600,10 +702,13 @@ def _read_axml(data):
                 _ans, aname, raw, _sz, _res, dtype, value = struct.unpack_from("<iiiHBBI", data, at)
                 if not 0 <= aname < len(strings):
                     continue
+                if raw == -1 and dtype in (0x10, 0x11):  # integer attribute (versionCode)
+                    found[strings[aname]] = str(value)
+                    continue
                 idx = raw if raw != -1 else (value if dtype == 3 else -1)
                 if 0 <= idx < len(strings):
                     found[strings[aname]] = strings[idx]
-            return found.get("package", ""), found.get("versionName", "")
+            return found
         pos += size
     raise ValueError("AndroidManifest.xml has no manifest element")
 
@@ -638,9 +743,11 @@ def import_apk(path):
             if "AndroidManifest.xml" not in names:
                 return {"ok": False, "error": "The file is not an APK (AndroidManifest.xml is missing)"}
             try:
-                pkg_id, version = _read_axml(apk.read("AndroidManifest.xml"))
+                manifest = _read_axml_full(apk.read("AndroidManifest.xml"))
             except (ValueError, struct.error, IndexError):
-                pkg_id, version = "", ""
+                manifest = {}
+            pkg_id, version = manifest.get("package", ""), manifest.get("versionName", "")
+            version_code = int(manifest["versionCode"]) if str(manifest.get("versionCode", "")).isdigit() else 0
     except zipfile.BadZipFile:
         return {"ok": False, "error": "Corrupted APK"}
 
@@ -676,6 +783,7 @@ def import_apk(path):
         "summary": "Your own APK",
         "icon": "",
         "version": version,
+        "versionCode": version_code,
         "apk": dest,
         "local": True,
     }
@@ -940,7 +1048,7 @@ def _load_index():
             except OSError:
                 continue
             with resp, gzip.GzipFile(fileobj=resp) as gz:
-                name = version = filename = None
+                name = version = filename = sha = None
                 for raw in io.TextIOWrapper(gz, encoding="utf-8", errors="replace"):
                     line = raw.rstrip("\n")
                     if line.startswith("Package: "):
@@ -949,12 +1057,16 @@ def _load_index():
                         version = line[9:]
                     elif line.startswith("Filename: "):
                         filename = line[10:]
+                    elif line.startswith("SHA256: "):
+                        sha = line[8:].strip().lower()
                     elif not line:
-                        if name and version and filename and (name.startswith("lib") or name in LIB_NAME_OVERRIDES.values()):
+                        # without a SHA256 the package cannot be verified, so it is not offered
+                        if (name and version and filename and sha
+                                and (name.startswith("lib") or name in LIB_NAME_OVERRIDES.values())):
                             key = _version_key(version)
                             if name not in index or index[name][0] < key:
-                                index[name] = (key, filename)
-                        name = version = filename = None
+                                index[name] = (key, filename, sha)
+                        name = version = filename = sha = None
     return index
 
 
@@ -975,14 +1087,19 @@ def _candidate_packages(soname):
     return names
 
 
-def _find_deb_url(soname, index_holder):
-    """Returns the .deb URL (from the Ubuntu noble index, so the version matches the system)."""
+def _find_deb(soname, index_holder):
+    """Returns (URL, sha256) of the .deb (from the Ubuntu noble index, so the version matches the system)."""
     if index_holder.get("index") is None:
         index_holder["index"] = _load_index()
     for package in _candidate_packages(soname):
         if package in index_holder["index"]:
-            return "%s/%s" % (PORTS_BASE.rstrip("/"), index_holder["index"][package][1])
+            _key, filename, sha = index_holder["index"][package]
+            return "%s/%s" % (PORTS_BASE.rstrip("/"), filename), sha
     raise ValueError("don't know which Ubuntu package contains it")
+
+
+def _find_deb_url(soname, index_holder):
+    return _find_deb(soname, index_holder)[0]
 
 
 def _reset_stale_extra_lib():
@@ -1000,7 +1117,10 @@ def _reset_stale_extra_lib():
 
 def _fetch_system_lib(soname, index_holder=None):
     """Downloads the .deb from Ubuntu and extracts only the libraries matching the soname."""
-    data = _http_get(_find_deb_url(soname, index_holder if index_holder is not None else {}))
+    url, expected_sha = _find_deb(soname, index_holder if index_holder is not None else {})
+    data = _http_get(url)
+    if hashlib.sha256(data).hexdigest() != expected_sha:
+        raise ValueError("the .deb does not match the sha256 in the Ubuntu index, rejected")
     prefix = soname.split(".so")[0] + ".so"
     os.makedirs(EXTRA_LIB_DIR, exist_ok=True)
     with open(os.path.join(EXTRA_LIB_DIR, ".scheme"), "w") as f:

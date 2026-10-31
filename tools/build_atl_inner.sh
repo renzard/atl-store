@@ -6,7 +6,7 @@ set -euo pipefail
 SRC=/src
 OUT=/tmp/out
 JOBS="${JOBS:-$(nproc)}"
-# Dependencies are cloned from upstream. Pin them to a tag/commit for reproducible builds.
+# Dependencies are cloned from upstream. tools/versions.env (read by build_atl.sh) pins them to a tag/commit.
 WOLFSSL_REF="${WOLFSSL_REF:-v5.8.2-stable}"
 BIONIC_REF="${BIONIC_REF:-master}"
 ART_REF="${ART_REF:-master}"

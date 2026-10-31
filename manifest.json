@@ -1,7 +1,7 @@
 {
     "name": "droidstore.renz21",
     "description": "Android app store for Ubuntu Touch via the Android Translation Layer",
-    "architecture": "$ENV{CLICK_ARCH}",
+    "architecture": "arm64",
     "title": "DroidStore",
     "hooks": {
         "droidstore": {
@@ -9,7 +9,7 @@
             "desktop": "droidstore.desktop"
         }
     },
-    "version": "0.1.1",
+    "version": "0.2.0",
     "maintainer": "renz21 <renzardpolitakis@gmail.com>",
     "framework": "ubuntu-sdk-20.04"
 }

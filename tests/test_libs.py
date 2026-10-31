@@ -2,6 +2,7 @@
 
     python3 tests/test_libs.py
 """
+import hashlib
 import http.server
 import io
 import os
@@ -99,7 +100,11 @@ for suite, component, packages in (
     os.makedirs(d)
     with gzip.open(os.path.join(d, "Packages.gz"), "wt") as f:
         for name, ver in packages:
-            f.write("Package: %s\nVersion: %s\nFilename: pool/main/f/foo/%s_1.0_%s.deb\n\n" % (name, ver, name, arch))
+            deb_path = os.path.join(pool2, "%s_1.0_%s.deb" % (name, arch))
+            with open(deb_path, "rb") as deb_file:
+                sha = hashlib.sha256(deb_file.read()).hexdigest()
+            f.write("Package: %s\nVersion: %s\nFilename: pool/main/f/foo/%s_1.0_%s.deb\nSHA256: %s\n\n"
+                    % (name, ver, name, arch, sha))
         f.write("Package: unrelated\nVersion: 1\nFilename: pool/x\n\n")
 
 E = store.EXTRA_LIB_DIR
@@ -139,4 +144,15 @@ msg = store._ensure_libs(["/x/atl"])
 assert "libwhatever.so.1" in msg, msg
 assert "libx11-6" in store._candidate_packages("libX11.so.6")
 assert store._candidate_packages("libOpenCL.so.1") == ["ocl-icd-libopencl1"]
+
+# a .deb whose content does not match the sha256 of the index is rejected
+bad = os.path.join(pool2, "libva3_1.0_%s.deb" % arch)
+with open(bad, "wb") as f:
+    f.write(b"tampered")
+shutil_rm = __import__("shutil").rmtree
+shutil_rm(E, ignore_errors=True)
+store._missing_libs = lambda cmd: [] if have("libVA.so.3") else ["libVA.so.3"]
+msg = store._ensure_libs(["/x/atl"])
+assert msg and "sha256" in msg, msg
+assert not have("libVA.so.3")
 print("test_libs: OK")

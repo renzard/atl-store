@@ -20,6 +20,11 @@ MainView {
     property string pendingLaunch: ""
     property string lastRunPkg: ""   // last app launched: its log can be opened
     property var detailsPage: null   // the open details page (if any)
+    property int updatesCount: 0     // installed apps with a newer version in the catalog
+    readonly property int pageSize: 60
+    property bool storeHasMore: false   // the last page was full: there may be more apps
+    property bool storeLoading: false
+    property int searchToken: 0         // ignores answers that belong to an older search
 
     ListModel { id: storeModel }
     ListModel { id: libraryModel }
@@ -35,7 +40,7 @@ MainView {
                 root.updateItem(pkg, { busy: true, progress: fraction });
             });
             setHandler("installed", function(pkg) {
-                root.updateItem(pkg, { busy: false, installed: true, progress: 0 });
+                root.updateItem(pkg, { busy: false, installed: true, updateAvailable: false, newVersion: "", progress: 0 });
                 root.refreshLibrary();
                 root.statusText = "Installation complete";
             });
@@ -50,6 +55,7 @@ MainView {
                 root.catalogBusy = false;
                 root.statusText = count + " apps in the catalog";
                 root.doSearch();
+                root.refreshLibrary();  // new catalog: the update badges may change
             });
             setHandler("catalog_error", function(message) {
                 root.catalogBusy = false;
@@ -118,14 +124,58 @@ MainView {
     }
 
     function doSearch() {
-        py.call("store.search", [searchField.text, pureOnly.checked], function(items) {
+        var token = ++searchToken;
+        storeLoading = true;
+        py.call("store.search", [searchField.text, pureOnly.checked, pageSize, 0], function(items) {
+            if (token !== root.searchToken) {
+                return;
+            }
             fillModel(storeModel, items);
+            root.storeHasMore = items.length === root.pageSize;
+            root.storeLoading = false;
+        });
+    }
+
+    // next page of the same search, when the end of the list is reached
+    function loadMore() {
+        if (!storeHasMore || storeLoading) {
+            return;
+        }
+        var token = searchToken;
+        storeLoading = true;
+        py.call("store.search", [searchField.text, pureOnly.checked, pageSize, storeModel.count], function(items) {
+            if (token !== root.searchToken) {
+                return;
+            }
+            for (var i = 0; i < items.length; i++) {
+                storeModel.append(items[i]);
+            }
+            root.storeHasMore = items.length === root.pageSize;
+            root.storeLoading = false;
         });
     }
 
     function refreshLibrary() {
         py.call("store.list_installed", [], function(items) {
             fillModel(libraryModel, items);
+            var n = 0;
+            for (var i = 0; i < items.length; i++) {
+                if (items[i].updateAvailable) {
+                    n++;
+                }
+            }
+            root.updatesCount = n;
+        });
+    }
+
+    function updateAll() {
+        for (var i = 0; i < libraryModel.count; i++) {
+            if (libraryModel.get(i).updateAvailable) {
+                updateItem(libraryModel.get(i).pkgId, { busy: true, progress: 0 });
+            }
+        }
+        py.call("store.update_all", [], function(count) {
+            root.statusText = count > 0 ? "Updating " + count + " app(s)…" : "Everything is up to date";
         });
     }
 
@@ -353,6 +403,8 @@ MainView {
                     }
                     clip: true
                     model: storeModel
+                    cacheBuffer: units.gu(40)
+                    onAtYEndChanged: if (atYEnd) root.loadMore()
 
                     delegate: ListItem {
                         height: units.gu(9)
@@ -375,11 +427,14 @@ MainView {
                             Button {
                                 SlotsLayout.position: SlotsLayout.Trailing
                                 width: units.gu(11)
-                                text: model.installed ? "Open"
-                                      : (model.busy ? Math.round(model.progress * 100) + "%" : "Get")
+                                text: model.busy ? Math.round(model.progress * 100) + "%"
+                                      : (model.updateAvailable ? "Update"
+                                         : (model.installed ? "Open" : "Get"))
                                 enabled: !model.busy
-                                color: model.installed ? theme.palette.normal.positive : theme.palette.normal.activity
-                                onClicked: model.installed ? root.launchApp(model.pkgId) : root.installApp(model.pkgId)
+                                color: (model.installed && !model.updateAvailable)
+                                       ? theme.palette.normal.positive : theme.palette.normal.activity
+                                onClicked: (model.installed && !model.updateAvailable)
+                                           ? root.launchApp(model.pkgId) : root.installApp(model.pkgId)
                             }
                         }
                     }
@@ -405,13 +460,27 @@ MainView {
                 clip: true
                 model: libraryModel
 
+                header: Item {
+                    width: libraryList.width
+                    height: root.updatesCount > 0 ? units.gu(7) : 0
+                    visible: root.updatesCount > 0
+
+                    Button {
+                        anchors.centerIn: parent
+                        text: "Update all (" + root.updatesCount + ")"
+                        color: theme.palette.normal.activity
+                        onClicked: root.updateAll()
+                    }
+                }
+
                 delegate: ListItem {
                     height: units.gu(9)
                     onClicked: root.openDetails(model.pkgId)
 
                     ListItemLayout {
                         title.text: model.name
-                        subtitle.text: model.version + (model.local ? " • your own APK" : "")
+                        subtitle.text: model.updateAvailable ? model.version + " → " + model.newVersion
+                                       : model.version + (model.local ? " • your own APK" : "")
 
                         Image {
                             SlotsLayout.position: SlotsLayout.Leading
@@ -428,9 +497,13 @@ MainView {
 
                             Button {
                                 width: units.gu(11)
-                                text: "Open"
-                                color: theme.palette.normal.positive
-                                onClicked: root.launchApp(model.pkgId)
+                                text: model.busy ? Math.round(model.progress * 100) + "%"
+                                      : (model.updateAvailable ? "Update" : "Open")
+                                enabled: !model.busy
+                                color: model.updateAvailable ? theme.palette.normal.activity
+                                                             : theme.palette.normal.positive
+                                onClicked: model.updateAvailable ? root.installApp(model.pkgId)
+                                                                 : root.launchApp(model.pkgId)
                             }
                             Button {
                                 width: units.gu(5)

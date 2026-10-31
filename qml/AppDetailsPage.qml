@@ -133,11 +133,20 @@ Page {
 
                 Button {
                     width: units.gu(18)
-                    text: page.info.installed ? "Open"
-                          : (page.info.busy ? Math.round((page.info.progress || 0) * 100) + "%" : "Get")
+                    text: page.info.busy ? Math.round((page.info.progress || 0) * 100) + "%"
+                          : (page.info.updateAvailable ? "Update"
+                             : (page.info.installed ? "Open" : "Get"))
                     enabled: !page.info.busy
-                    color: page.info.installed ? theme.palette.normal.positive : theme.palette.normal.activity
-                    onClicked: page.info.installed ? appRoot.launchApp(page.pkgId) : appRoot.installApp(page.pkgId)
+                    color: (page.info.installed && !page.info.updateAvailable)
+                           ? theme.palette.normal.positive : theme.palette.normal.activity
+                    onClicked: (page.info.installed && !page.info.updateAvailable)
+                               ? appRoot.launchApp(page.pkgId) : appRoot.installApp(page.pkgId)
+                }
+                Button {
+                    visible: page.info.updateAvailable === true && !page.info.busy
+                    width: units.gu(11)
+                    text: "Open"
+                    onClicked: appRoot.launchApp(page.pkgId)
                 }
                 Button {
                     visible: page.info.installed === true

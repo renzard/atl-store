@@ -20,9 +20,9 @@ os.makedirs(os.path.join(tmp, "home", "Downloads"))
 import store  # noqa: E402
 
 
-def build_axml(package, version):
+def build_axml(package, version, version_code=None):
     """Builds a minimal binary AndroidManifest.xml (UTF-16 string pool, one <manifest> element)."""
-    strings = ["package", "versionName", "manifest", package, version]
+    strings = ["package", "versionName", "manifest", package, version, "versionCode"]
     blobs = b""
     offsets = []
     for text in strings:
@@ -37,16 +37,20 @@ def build_axml(package, version):
     attrs = b""
     for name_idx, value_idx in ((0, 3), (1, 4)):
         attrs += struct.pack("<iiiHBBI", -1, name_idx, value_idx, 8, 0, 3, value_idx)
+    count = 2
+    if version_code is not None:  # integer attribute: no string, type 0x10
+        attrs += struct.pack("<iiiHBBI", -1, 5, -1, 8, 0, 0x10, version_code)
+        count = 3
     element = struct.pack("<HHIii", 0x0102, 16, 36 + len(attrs), 1, -1)
-    element += struct.pack("<iiHHHHHH", -1, 2, 20, 20, 2, 0, 0, 0) + attrs
+    element += struct.pack("<iiHHHHHH", -1, 2, 20, 20, count, 0, 0, 0) + attrs
 
     body = pool + element
     return struct.pack("<HHI", 0x0003, 8, 8 + len(body)) + body
 
 
-def make_apk(path, package="org.example.hello", version="1.2.3", extra=()):
+def make_apk(path, package="org.example.hello", version="1.2.3", extra=(), version_code=None):
     with zipfile.ZipFile(path, "w") as z:
-        z.writestr("AndroidManifest.xml", build_axml(package, version))
+        z.writestr("AndroidManifest.xml", build_axml(package, version, version_code))
         z.writestr("classes.dex", b"dex\n035\x00")
         for name in extra:
             z.writestr(name, b"\x7fELF")
@@ -56,6 +60,8 @@ def make_apk(path, package="org.example.hello", version="1.2.3", extra=()):
 apk = os.path.join(tmp, "home", "Downloads", "My_Hello-App.apk")
 make_apk(apk)
 assert store._read_axml(build_axml("a.b.c", "9")) == ("a.b.c", "9")
+assert store._read_axml_full(build_axml("a.b.c", "9", 4217))["versionCode"] == "4217"
+assert store._read_axml(build_axml("a.b.c", "9", 4217)) == ("a.b.c", "9")
 result = store.import_apk(apk)
 assert result["ok"], result
 assert result["pkgId"] == "org.example.hello", result
@@ -109,3 +115,10 @@ assert store.list_installed() == []
 assert not os.path.exists(apk_copy)
 
 print("test_import: OK")
+
+# the versionCode of the manifest is stored (updates compare against it)
+vc_apk = os.path.join(tmp, "home", "Downloads", "vc.apk")
+make_apk(vc_apk, package="org.example.vc", version="2.0", version_code=42)
+assert store.import_apk(vc_apk)["ok"]
+assert store._read_json(store.LIBRARY_FILE, {})["org.example.vc"]["versionCode"] == 42
+print("test_import (versionCode): OK")
